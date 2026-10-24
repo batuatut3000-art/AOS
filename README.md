@@ -24,7 +24,6 @@ AOS is an early-stage hobby project under active development. Features and hardw
 - Improve filesystem functionality
 - Add file reading and writing commands such as `cat` and `echo`
 - Support persistent file storage
-- Test on real hardware
 - Continue developing a lightweight, DOS-inspired command-line operating system
 
 **AOS is built for learning, experimentation, and the fun of creating an operating system from scratch.**
