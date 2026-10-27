@@ -8,8 +8,8 @@ ASFLAGS = -f elf32
 LD = ld
 LDFLAGS = -m elf_i386 -T linker.ld
 
-OBJS = kernel_asm.o kernel.o keyboard.o acpi.o
-
+SRCS = kernel.c keyboard.c disk.c acpi.c
+OBJS = kernel_asm.o kernel.o keyboard.o disk.o acpi.o
 .PHONY: all run clean
 
 all: myos.iso
@@ -44,7 +44,7 @@ myos.iso: kernel.bin
 	grub-mkrescue -o myos.iso iso
 
 run: myos.iso
-	qemu-system-x86_64 -machine q35 -m 512M \
+	qemu-system-x86_64 -machine pc -m 512M \
 		-cdrom "$(CURDIR)/myos.iso" \
 		-drive file=disk.qcow2,format=qcow2,if=ide,index=0 \
 		-boot order=d -serial stdio -vga std

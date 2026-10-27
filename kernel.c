@@ -11,21 +11,216 @@
 #define COLOR_LIGHT_BLUE 0x0B
 #define COLOR_LIGHT_RED 0x0C
 #define COLOR_YELLOW 0x0E
-
+#define KEY_UP   ((char)0x80)
+#define KEY_DOWN ((char)0x81)
 #define FS_MAX_ENTRIES 64
 #define FS_NAME_SIZE   32
 #define FS_PATH_SIZE   64
-const acpi_rsdp_t *kernel_rsdp = 0;
-void terminal_print(const char *str);
-void string_copy(char *dest, const char *src);
+#include "disk.h"
+#define HISTORY_SIZE 32
+#define HISTORY_LINE_SIZE 256
+
+#define FS_BACKUP_MAGIC   0x414F5346U
+#define FS_BACKUP_VERSION 1U
+#define FS_BACKUP_OFFSET  17U
+
 typedef struct {
     char name[FS_NAME_SIZE];
     char parent[FS_PATH_SIZE];
-    int is_dir;  // 1 = каталог, 0 = файл
+    int is_dir;
     int used;
 } fs_entry_t;
 
 static fs_entry_t fs_entries[FS_MAX_ENTRIES];
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t entry_count;
+    uint32_t checksum;
+    fs_entry_t entries[FS_MAX_ENTRIES];
+} fs_backup_image_t;
+static uint8_t fs_backup_buffer[BACKUP_SECTORS * DISK_SECTOR_SIZE];
+
+static uint32_t fs_checksum(const uint8_t *data, uint32_t size)
+{
+    uint32_t hash = 2166136261U;
+
+    for (uint32_t i = 0; i < size; i++) {
+        hash ^= data[i];
+        hash *= 16777619U;
+    }
+
+    return hash;
+}
+
+void fs_backup(void)
+{
+    if (!disk_is_ready()) {
+        terminal_print_color(
+            "Filesystem backup failed: disk unavailable.\n",
+            COLOR_LIGHT_RED
+        );
+        return;
+    }
+
+    uint32_t total_sectors = disk_get_sector_count();
+
+    if (total_sectors < BACKUP_SECTORS) {
+        terminal_print("Filesystem backup failed: disk too small.\n");
+        return;
+    }
+
+    uint32_t sectors =
+        ((uint32_t)sizeof(fs_backup_image_t) +
+         DISK_SECTOR_SIZE - 1U) / DISK_SECTOR_SIZE;
+
+    if (FS_BACKUP_OFFSET + sectors > BACKUP_SECTORS ||
+        sizeof(fs_backup_image_t) > sizeof(fs_backup_buffer)) {
+        terminal_print("Filesystem backup failed: image too large.\n");
+        return;
+    }
+
+    for (uint32_t i = 0; i < sizeof(fs_backup_buffer); i++)
+        fs_backup_buffer[i] = 0;
+
+    fs_backup_image_t *image =
+        (fs_backup_image_t *)fs_backup_buffer;
+
+    image->magic = FS_BACKUP_MAGIC;
+    image->version = FS_BACKUP_VERSION;
+    image->entry_count = FS_MAX_ENTRIES;
+    image->checksum = 0;
+
+    for (uint32_t i = 0; i < FS_MAX_ENTRIES; i++) {
+        image->entries[i] = fs_entries[i];
+
+        /* Захист від некоректних рядків */
+        image->entries[i].name[FS_NAME_SIZE - 1] = '\0';
+        image->entries[i].parent[FS_PATH_SIZE - 1] = '\0';
+    }
+
+    image->checksum = fs_checksum(
+        fs_backup_buffer,
+        (uint32_t)sizeof(fs_backup_image_t)
+    );
+
+    uint32_t first_lba =
+        total_sectors - BACKUP_SECTORS + FS_BACKUP_OFFSET;
+
+    for (uint32_t i = 0; i < sectors; i++) {
+        if (!disk_write_sector(
+                first_lba + i,
+                &fs_backup_buffer[i * DISK_SECTOR_SIZE])) {
+            terminal_print_color(
+                "Filesystem backup failed: disk write error.\n",
+                COLOR_LIGHT_RED
+            );
+            return;
+        }
+    }
+
+    terminal_print_color(
+        "Filesystem backup saved.\n",
+        COLOR_GREEN
+    );
+}
+
+void fs_restore(void)
+{
+    if (!disk_is_ready()) {
+        terminal_print("Filesystem restore failed: disk unavailable.\n");
+        return;
+    }
+
+    uint32_t total_sectors = disk_get_sector_count();
+
+    if (total_sectors < BACKUP_SECTORS)
+        return;
+
+    uint32_t sectors =
+        ((uint32_t)sizeof(fs_backup_image_t) +
+         DISK_SECTOR_SIZE - 1U) / DISK_SECTOR_SIZE;
+
+    if (FS_BACKUP_OFFSET + sectors > BACKUP_SECTORS ||
+        sizeof(fs_backup_image_t) > sizeof(fs_backup_buffer)) {
+        terminal_print("Filesystem restore failed: image too large.\n");
+        return;
+    }
+
+    for (uint32_t i = 0; i < sizeof(fs_backup_buffer); i++)
+        fs_backup_buffer[i] = 0;
+
+    uint32_t first_lba =
+        total_sectors - BACKUP_SECTORS + FS_BACKUP_OFFSET;
+
+    for (uint32_t i = 0; i < sectors; i++) {
+        if (!disk_read_sector(
+                first_lba + i,
+                &fs_backup_buffer[i * DISK_SECTOR_SIZE])) {
+            terminal_print_color(
+                "Filesystem restore failed: disk read error.\n",
+                COLOR_LIGHT_RED
+            );
+            return;
+        }
+    }
+
+    fs_backup_image_t *image =
+        (fs_backup_image_t *)fs_backup_buffer;
+
+    if (image->magic != FS_BACKUP_MAGIC ||
+        image->version != FS_BACKUP_VERSION ||
+        image->entry_count != FS_MAX_ENTRIES) {
+        terminal_print("No valid filesystem backup found.\n");
+        return;
+    }
+
+    uint32_t saved_checksum = image->checksum;
+    image->checksum = 0;
+
+    uint32_t actual_checksum = fs_checksum(
+        fs_backup_buffer,
+        (uint32_t)sizeof(fs_backup_image_t)
+    );
+
+    if (actual_checksum != saved_checksum) {
+        terminal_print_color(
+            "Filesystem restore failed: checksum error.\n",
+            COLOR_LIGHT_RED
+        );
+        return;
+    }
+
+    for (uint32_t i = 0; i < FS_MAX_ENTRIES; i++) {
+        fs_entries[i] = image->entries[i];
+
+        fs_entries[i].name[FS_NAME_SIZE - 1] = '\0';
+        fs_entries[i].parent[FS_PATH_SIZE - 1] = '\0';
+
+        if (fs_entries[i].used != 0 &&
+            fs_entries[i].used != 1) {
+            terminal_print("Filesystem restore failed: invalid entry.\n");
+            return;
+        }
+    }
+
+    terminal_print_color(
+        "Filesystem restored.\n",
+        COLOR_GREEN
+    );
+}
+
+static char command_history[HISTORY_SIZE][HISTORY_LINE_SIZE];
+static int history_count = 0;
+static int history_index = 0;
+char keyboard_read_char(void);
+
+static char last_command[256];
+static char command_history[HISTORY_SIZE][256];
+
+const acpi_rsdp_t *kernel_rsdp = 0;
+void terminal_print(const char *str);
+void string_copy(char *dest, const char *src);
 
 
 static inline void outw(unsigned short port, unsigned short value)
@@ -853,19 +1048,93 @@ void reboot_system(void)
         __asm__ volatile ("hlt");
     }
 }
-static int fs_split_file_path(
-    const char *full_path,
-    char *parent,
-    char *name
-);
-/* Реалізація команд */
-void execute_command_internal(const char *cmd, int is_budo);
+
+void execute_command_internal(char *cmd, int is_budo);
 
 void execute_command(const char *cmd) {
-    execute_command_internal(cmd, 0);
+    char command_copy[256];
+    unsigned int i = 0;
+
+    // Копіюємо команду для виконання
+    while (i < sizeof(command_copy) - 1 && cmd[i] != '\0') {
+        command_copy[i] = cmd[i];
+        i++;
+    }
+    command_copy[i] = '\0';
+
+    // Не перезаписуємо попередню команду через !budo
+    if (!(
+        string_compare(command_copy, "!budo") ||
+        string_compare(command_copy, "!BUDO")
+    )) {
+        i = 0;
+
+        while (i < sizeof(last_command) - 1 &&
+               command_copy[i] != '\0') {
+            last_command[i] = command_copy[i];
+            i++;
+        }
+
+        last_command[i] = '\0';
+    }
+
+    execute_command_internal(command_copy, 0);
 }
 
-void execute_command_internal(const char *cmd, int is_budo) {
+void execute_command_internal(char *cmd, int is_budo) {
+    
+if (string_compare(cmd, "backup")) {
+    if (!disk_is_ready()) {
+        terminal_print_color(
+            "Backup failed: disk not available.\n",
+            COLOR_LIGHT_RED
+        );
+        return;
+    }
+
+    if (history_backup(
+            command_history,
+            (uint32_t)history_count
+        )) {
+        terminal_print_color(
+            "Command history backup saved.\n",
+            COLOR_GREEN
+        );
+    } else {
+        terminal_print_color(
+            "Backup failed: could not save history.\n",
+            COLOR_LIGHT_RED
+        );
+    }
+
+    fs_backup();
+
+    return;
+}
+
+    if (string_compare(cmd, "!budo") ||
+        string_compare(cmd, "!BUDO")) {
+
+        if (last_command[0] == '\0') {
+            terminal_print("No previous command!\n");
+            return;
+        }
+
+        char retry[256];
+        unsigned int i = 0;
+
+        while (i < sizeof(retry) - 1 &&
+               last_command[i] != '\0') {
+            retry[i] = last_command[i];
+            i++;
+        }
+
+        retry[i] = '\0';
+
+        execute_command_internal(retry, 1);
+        return;
+    }
+
     if (string_compare(cmd, "help")) {
         terminal_print("AOS Available commands:\n");
         terminal_print("\n");
@@ -1106,7 +1375,7 @@ void execute_command_internal(const char *cmd, int is_budo) {
         terminal_print("\n");
     }
 }
-
+      
 extern char keyboard_read_char();
 
 
@@ -1117,6 +1386,7 @@ void kmain(unsigned int multiboot_magic,
 
     if (multiboot_magic != MULTIBOOT2_BOOTLOADER_MAGIC) {
         terminal_initialize(multiboot_info);
+
         terminal_print_color(
             "Boot error: not loaded via Multiboot 2.\n",
             COLOR_LIGHT_RED
@@ -1127,20 +1397,63 @@ void kmain(unsigned int multiboot_magic,
         }
     }
 
+    /* Ініціалізуємо термінал один раз */
     terminal_initialize(multiboot_info);
     terminal_clear();
 
+    /* Ініціалізуємо диск один раз */
+    int disk_ready = disk_init();
+
+    if (disk_ready) {
+        /* Відновлюємо історію команд */
+        uint32_t restored_count = 0;
+
+        if (history_restore(
+                command_history,
+                HISTORY_SIZE,
+                &restored_count)) {
+
+            history_count = (int)restored_count;
+
+            terminal_print(
+                "Command history restored.\n"
+            );
+        } else {
+            terminal_print(
+                "No valid history backup found.\n"
+            );
+        }
+
+        /* Відновлюємо файлову систему */
+        fs_restore();
+
+    } else {
+        terminal_print_color(
+            "Disk not available.\n",
+            COLOR_LIGHT_RED
+        );
+    }
+
+    /* Банер AOS */
     terminal_print_color(
         "=== AOS v0.1 (First Version) ===\n",
         COLOR_GREEN
     );
-    terminal_print("Type 'help' for available commands.\n\n");
 
-    const acpi_rsdp_t *rsdp = acpi_find_rsdp(multiboot_info);
+    terminal_print(
+        "Type 'help' for available commands.\n\n"
+    );
+
+    /* ACPI */
+    const acpi_rsdp_t *rsdp =
+        acpi_find_rsdp(multiboot_info);
+
     kernel_rsdp = rsdp;
 
     if (rsdp != 0) {
-        terminal_print("ACPI: RSDP found via Multiboot 2\n");
+        terminal_print(
+            "ACPI: RSDP found via Multiboot 2\n"
+        );
     } else {
         terminal_print_color(
             "ACPI: RSDP not found in Multiboot 2 tags\n",
@@ -1148,35 +1461,123 @@ void kmain(unsigned int multiboot_magic,
         );
     }
 
-    
-print_prompt();
-input_index = 0;
+    /* Початковий prompt */
+    print_prompt();
+    input_index = 0;
+    input_buffer[0] = '\0';
+    history_index = history_count;
 
-while (1) {
-    char c = keyboard_read_char();
+    /* Основний цикл оболонки */
+    while (1) {
+        char c = keyboard_read_char();
 
-    if (c == '\n') {
-        input_buffer[input_index] = '\0';
-        terminal_print("\n");
+        /* Стрілки вгору та вниз — історія команд */
+        if (c == KEY_UP || c == KEY_DOWN) {
+            if (history_count == 0) {
+                continue;
+            }
 
-        execute_command_internal(input_buffer, 0);
+            int available = history_count < HISTORY_SIZE
+                ? history_count
+                : HISTORY_SIZE;
 
-        input_index = 0;
-        print_prompt();
-    }
-    else if (c == '\b') {
-        if (input_index > 0) {
-            input_index--;
+            int oldest = history_count - available;
+
+            if (c == KEY_UP) {
+                if (history_index > oldest) {
+                    history_index--;
+                }
+            } else {
+                if (history_index < history_count) {
+                    history_index++;
+                }
+            }
+
+            /* Очистити поточний рядок */
+            while (input_index > 0) {
+                terminal_print("\b \b");
+                input_index--;
+            }
+
+            input_buffer[0] = '\0';
+
+            /* Порожній рядок після останньої команди */
+            if (history_index >= history_count) {
+                continue;
+            }
+
+            unsigned int slot =
+                (unsigned int)history_index % HISTORY_SIZE;
+
+            unsigned int i = 0;
+
+            while (i < sizeof(input_buffer) - 1 &&
+                   command_history[slot][i] != '\0') {
+                input_buffer[i] = command_history[slot][i];
+                i++;
+            }
+
+            input_buffer[i] = '\0';
+            input_index = (int)i;
+
+            terminal_print(input_buffer);
+            continue;
+        }
+
+        /* Enter */
+        if (c == '\n') {
             input_buffer[input_index] = '\0';
-            terminal_print("\b");
+            terminal_print("\n");
+
+            if (input_index > 0) {
+                unsigned int slot =
+                    (unsigned int)history_count % HISTORY_SIZE;
+
+                unsigned int i = 0;
+
+                while (i < sizeof(command_history[slot]) - 1 &&
+                       input_buffer[i] != '\0') {
+                    command_history[slot][i] = input_buffer[i];
+                    i++;
+                }
+
+                command_history[slot][i] = '\0';
+
+                if (history_count < HISTORY_SIZE) {
+                    history_count++;
+                }
+
+                history_index = history_count;
+            }
+
+            execute_command(input_buffer);
+
+            input_index = 0;
+            input_buffer[0] = '\0';
+            history_index = history_count;
+
+            print_prompt();
+        }
+
+        /* Backspace */
+        else if (c == '\b') {
+            if (input_index > 0) {
+                input_index--;
+                input_buffer[input_index] = '\0';
+
+                terminal_print("\b \b");
+            }
+        }
+
+        /* Звичайні символи */
+        else if ((unsigned char)c >= 32 &&
+                 input_index < (int)sizeof(input_buffer) - 1) {
+
+            input_buffer[input_index++] = c;
+            input_buffer[input_index] = '\0';
+
+            char temp[2] = { c, '\0' };
+            terminal_print(temp);
         }
     }
-    else if (input_index >= 0 &&
-         (unsigned int)input_index < sizeof(input_buffer) - 1) {
-        input_buffer[input_index++] = c;
-        char temp[2] = { c, '\0' };
-        terminal_print(temp);
-    }
-}
-
 }
